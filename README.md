@@ -1,156 +1,216 @@
 # IMS-Model-Forecasting
 
-Forecasting and anomaly-aware modeling pipeline for **Integrated Monitoring System (IMS)** industrial sensor data using deep learning and time-series forecasting approaches.
+Benchmarking and anomaly-aware forecasting pipeline for **Integrated Monitoring System (IMS)** industrial sensor data using modern deep learning time-series architectures.
+
+---
 
 ## Overview
 
-**IMS-Model-Forecasting** is a research-oriented forecasting project developed during an internship at **Pertamina EP**. The project focuses on predicting future sensor behavior (initially **pressure**) from historical time-series data and evaluating multiple forecasting architectures for industrial monitoring applications.
+**IMS-Model-Forecasting** is a research-oriented forecasting project developed during an internship at **Pertamina EP**. The project focuses on predicting future industrial sensor behavior from historical time-series data and benchmarking multiple forecasting architectures for monitoring, anomaly detection, and early warning applications.
 
-The current implementation includes:
+The current benchmark uses **pressure sensor data** sampled at **1-minute frequency** and compares five deep learning forecasting models under the same preprocessing and evaluation pipeline.
 
-- Data preprocessing and window generation
-- Univariate time-series forecasting
-- Model training and evaluation
-- Metric benchmarking
-- Experiment tracking for multiple forecasting models
+### Current Project Status
 
----
-
-## Objectives
-
-- Forecast industrial sensor values for the next **24 minutes** using historical observations.
-- Compare modern deep learning forecasting architectures on IMS sensor data.
-- Develop a production-oriented forecasting pipeline for monitoring and early warning applications.
-
-### Target Performance
-
-| Metric | Target |
-|--------|--------|
-| MAE | ≤ 10 |
-| MSE | ≤ 200 |
-| RMSE | ≤ 25 |
-| MAPE | ≤ 5% |
-| R² Score | ≥ 0.70 |
+- Dataset cleaning and reconstruction: **Completed**
+- Preprocessing pipeline: **Completed**
+- Model benchmarking (5 architectures): **Completed**
+- Evaluation and artifact export: **Completed**
+- Multivariate forecasting phase: **In Progress**
+- Ensemble and hybrid modeling phase: **Planned**
 
 ---
 
-## Current Models
+## Dataset Pipeline
 
-| Model | Status |
-|------|--------|
-| PatchTST | Implemented |
-| N-BEATSx | Planned |
-| Temporal Convolutional Network (TCN) | Planned |
-| DeepAR | Planned |
-| Temporal Fusion Transformer (TFT) | Planned |
+### Data Cleaning Strategy
 
----
+The following cleaning procedure is applied consistently across all models:
 
-## Current Experiment: PatchTST
+- Remove invalid records from **2025-08-01 to 2026-04-30**
+- Merge valid historical and recent segments
+- Resample to **1-minute frequency**
+- Interpolate small temporal gaps
+- Preserve chronological order to avoid temporal leakage
 
-### Configuration
+### Final Processed Dataset
 
-- **Context Length:** 96 time steps
-- **Prediction Horizon:** 24 time steps
-- **Input:** Univariate pressure sensor
-- **Framework:** PyTorch + Hugging Face Transformers
+| Split | Samples |
+|------|--------:|
+| Total | 526,115 |
+| Train | 498,240 |
+| Evaluation (July 2026) | 27,875 |
 
-### Initial Evaluation Result
-
-| Metric | Value |
-|--------|------:|
-| MAE | 29.47 |
-| MSE | 5257.73 |
-| RMSE | 72.51 |
-| MAPE | 851.01% |
-| R² Score | 0.269 |
-
-### Preliminary Analysis
-
-The initial PatchTST model successfully learns part of the temporal pattern from the pressure data, but the current performance is **not yet production-ready**.
-
-**Key observations:**
-
-- **R² = 0.269** indicates the model currently explains only about **26.9%** of the variance in the target series.
-- **RMSE = 72.51** shows that prediction deviations are still relatively large.
-- **MAPE is extremely high**, suggesting that percentage-based error is heavily affected by values close to zero or strong fluctuations in the dataset.
-- The current result should be treated as a **baseline experiment** rather than a final forecasting solution.
+The evaluation set uses **July 2026** as an unseen forecasting period for fair model comparison.
 
 ---
 
-## Dataset
+## Forecasting Objective
 
-The current experiment uses **processed IMS pressure sensor data** exported into NumPy arrays for efficient training.
+Predict future pressure sensor values using historical observations.
 
-### Data Split
+### Forecast Configuration
 
-- **Train:** 4,774 samples
-- **Test:** 437 samples
-
-The preprocessing workflow includes:
-
-- Timestamp alignment
-- Data cleaning
-- Scaling
-- Sliding window generation
-- Train/test separation without temporal leakage
+- **Input window:** 144 minutes
+- **Forecast horizon:** 12–24 minutes (depending on architecture)
+- **Sampling frequency:** 1 minute
+- **Target:** Pressure sensor
 
 ---
 
-## Why Multiple Models?
+# Implemented Models
 
-Industrial sensor forecasting has different characteristics from typical business time-series data:
-
-- High-frequency measurements
-- Sudden spikes and regime changes
-- Operational transitions (startup/shutdown)
-- Strong cross-sensor dependencies
-
-Therefore, several architectures are evaluated for different strengths:
-
-| Model | Main Strength |
-|------|---------------|
-| N-BEATSx | Strong univariate forecasting |
-| TCN | Spike and local pattern detection |
-| PatchTST | Long-range multivariate dependencies |
-| TFT | Interpretable forecasting with operational metadata |
-| DeepAR | Probabilistic forecasting and uncertainty estimation |
+| Model | Status | Main Strength |
+|------|--------|---------------|
+| PatchTST | Implemented | Long-range temporal dependencies |
+| N-BEATS | Implemented | Strong univariate trend and seasonality modeling |
+| Temporal Convolutional Network (TCN) | Implemented | Local pattern and spike modeling |
+| DeepAR | Implemented | Probabilistic short-horizon forecasting |
+| Temporal Fusion Transformer (TFT) | Implemented | Interpretable sequence forecasting |
 
 ---
 
-## Future Work
+# Benchmark Results
 
-### Short Term
+All models are evaluated on the same IMS pressure forecasting pipeline.
 
-- Implement N-BEATSx baseline
-- Implement TCN baseline
-- Perform hyperparameter optimization with Optuna
-- Investigate high MAPE root cause
+| Model | MAE | RMSE | SMAPE | R² |
+|------|----:|-----:|------:|---:|
+| **PatchTST** | **21.97** | **53.93** | 19.50% | 0.557 |
+| TFT | 16.68 | 16.69 | 5.27%* | -4630.66 |
+| TCN | 27.18 | 60.98 | 18.68% | 0.405 |
+| DeepAR | 3.29 | 3.69 | **0.92%** | 0.190 |
+| N-BEATS | 47.58 | 245.87 | 1.45% | **0.982** |
 
-### Medium Term
+> **Note:** TFT currently uses MAPE and still requires additional evaluation because the R² value is inconsistent with the error metrics.
 
-Integrate additional IMS sensor parameters:
+---
 
+# Model Comparison Analysis
+
+## PatchTST — Best Operational Trade-off
+
+**Current best production-oriented candidate**
+
+**Strengths**
+- Lowest practical absolute forecasting error
+- Stable generalization on large-scale data
+- Strong potential for future multivariate expansion
+
+**Best for**
+- Real-time operational forecasting
+- Dashboard prediction
+- KPI monitoring
+
+---
+
+## N-BEATS — Best Temporal Dynamics Representation
+
+N-BEATS achieved:
+
+- **R² = 0.9815**
+- **Signal correlation ≈ 0.992**
+
+This indicates exceptional capability in modeling the underlying temporal structure of the pressure signal, although absolute error metrics are still affected by evaluation alignment and scaling considerations.
+
+**Best for**
+- Trend reconstruction
+- Long-term temporal dynamics
+- Residual and ensemble modeling
+
+---
+
+## TCN — Robust Baseline
+
+**Strengths**
+- Simple architecture
+- Good local pattern modeling
+- Competitive baseline performance
+
+**Best for**
+- Spike detection
+- Short local dependencies
+- Lightweight deployment
+
+---
+
+## DeepAR — Short-Horizon Specialist
+
+**Strengths**
+- Excellent short-window forecasting metrics
+- Probabilistic output
+- Uncertainty-aware forecasting
+
+**Limitations**
+- Lower explanatory power on long evaluation periods
+
+**Best for**
+- Confidence interval prediction
+- Early warning probability estimation
+
+---
+
+## TFT — Requires Further Investigation
+
+TFT shows low MAE and RMSE but highly unstable R², suggesting that additional hyperparameter tuning and evaluation alignment are required before drawing conclusions.
+
+---
+
+# Current Research Insight
+
+A key observation from the benchmark is the difference between **absolute forecasting accuracy** and **temporal structure modeling**.
+
+### Absolute Error Perspective
+
+**PatchTST** currently provides the best balance between MAE, RMSE, and generalization.
+
+### Temporal Dynamics Perspective
+
+**N-BEATS** captures the shape and evolution of the pressure signal with extremely high correlation and R².
+
+This suggests that the two models may be **complementary rather than mutually exclusive**.
+
+---
+
+# Planned Hybrid Architecture
+
+The next research phase explores an ensemble of the strongest complementary models.
+
+### Proposed Ensemble
+
+- **N-BEATS** → Trend and seasonality backbone
+- **PatchTST** → Long-range dependency correction
+- **TCN** → Local spike and residual correction
+
+This hybrid design is expected to improve both:
+
+- Absolute forecasting accuracy
+- Temporal pattern fidelity
+
+---
+
+# Multivariate Expansion (Next Phase)
+
+Additional IMS sensor parameters will be integrated:
+
+- Pressure
 - Temperature
-- Flow rate
+- Flowrate
 - Vibration
 - Valve position
 - Motor current
 - Production rate
 
-### Long Term
-
-- Build a **multivariate PatchTST forecasting pipeline**
-- Add **TFT with operational metadata**
-- Develop **anomaly-aware forecasting** for early warning systems
-- Deploy real-time inference for IMS monitoring dashboards
+This phase will enable true **N-BEATSX** and **multivariate PatchTST/TFT** experiments.
 
 ---
 
-## Tech Stack
+# Tech Stack
 
 - Python 3.10
 - PyTorch
+- PyTorch Forecasting
+- Lightning / PyTorch Lightning
 - Hugging Face Transformers
 - NumPy
 - Pandas
@@ -160,19 +220,21 @@ Integrate additional IMS sensor parameters:
 
 ---
 
-## Research Status
+# Research Status
 
-> This repository is an **active research and experimentation project**. Model architectures, preprocessing strategies, and evaluation procedures may evolve as additional sensor data becomes available and benchmarking experiments progress.
+**Current phase:** Large-scale univariate benchmarking on IMS pressure sensor data (**526k+ observations**).
+
+**Next phase:** Multivariate forecasting and ensemble modeling using pressure, temperature, flowrate, and vibration sensors for industrial anomaly-aware forecasting and early warning systems.
 
 ---
 
-## Contributors
+# Contributors
 
 - **Fakhri Muhammad Al Hisyam** — [@zepunnn](https://github.com/zepunnn)
 - **Ivan Febrianto Lalo** — [@schroerizaki](https://github.com/schroerizaki)
 
 ---
 
-## License
+# License
 
-This project is intended for research, educational, and industrial experimentation purposes related to **Integrated Monitoring System (IMS) forecasting and analytics**.
+This repository is intended for **research, educational, and industrial experimentation purposes** related to **Integrated Monitoring System (IMS) forecasting, analytics, and anomaly-aware monitoring**.
