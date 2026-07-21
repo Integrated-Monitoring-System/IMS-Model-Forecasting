@@ -1,5 +1,6 @@
 dataset
 PatchTST/artifacts
 Temporal Fusion Transformer/artifacts
+Temporal Convolutional Network/artifacts
 lightning_logs
 checkpoints
