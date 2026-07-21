@@ -39,8 +39,8 @@ np.random.seed(SEED)
 
 BASE_DIR = Path(__file__).resolve().parent
 
-TRAIN_PATH = BASE_DIR.parent / 'dataset' / 'processed' / 'train.npy'
-TEST_PATH = BASE_DIR.parent / 'dataset' / 'processed' / 'test.npy'
+TRAIN_PATH = BASE_DIR.parent / 'dataset' / 'PatchTST processed' / 'train.npy'
+TEST_PATH = BASE_DIR.parent / 'dataset' / 'PatchTST processed' / 'test.npy'
 SCALER_PATH = BASE_DIR / 'artifacts' / 'scaler.pkl'
 
 MODEL_DIR = BASE_DIR / 'artifacts'
