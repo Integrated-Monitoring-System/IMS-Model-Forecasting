@@ -3,5 +3,6 @@ PatchTST/artifacts
 Temporal Fusion Transformer/artifacts
 Temporal Convolutional Network/artifacts
 DeepAR/artifacts
+N-BeatsX/artifacts
 lightning_logs
 checkpoints
