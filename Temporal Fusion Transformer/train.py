@@ -240,18 +240,17 @@ mae = mean_absolute_error(y_true, y_pred)
 mse = mean_squared_error(y_true, y_pred)
 rmse = np.sqrt(mse)
 
-epsilon = 1e-8
-mape = np.mean(
-    np.abs((y_true - y_pred) / (y_true + epsilon))
+smape = np.mean(
+    2 * np.abs(y_pred - y_true) /
+    (np.abs(y_true) + np.abs(y_pred) + 1e-8)
 ) * 100
 
 r2 = r2_score(y_true, y_pred)
 
 results = pd.DataFrame({
-    'Metric': ['MAE', 'MSE', 'RMSE', 'MAPE (%)', 'R-Squared'],
-    'Value': [mae, mse, rmse, mape, r2]
+    'Metric': ['MAE', 'MSE', 'RMSE', 'SMAPE (%)', 'R-Squared'],
+    'Value': [mae, mse, rmse, smape, r2]
 })
-
 print('\\n' + '='*60)
 print('TEMPORAL FUSION TRANSFORMER RESULTS')
 print('='*60)
