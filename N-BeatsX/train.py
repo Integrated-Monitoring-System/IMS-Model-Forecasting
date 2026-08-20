@@ -775,22 +775,9 @@ def recursive_forecast(
     horizon: int,
     freq: str
 ):
-
     """
     Forecast Juli secara recursive.
-
-    Contoh:
-        TRAIN sampai 30 Juni
-
-        Forecast:
-            1-3 Juli
-            4-6 Juli
-            7-9 Juli
-            ...
-
-    Prediksi sebelumnya dimasukkan kembali ke histori.
-
-    Actual Juli TIDAK pernah dimasukkan ke histori.
+    ...
     """
 
     logger.info("=" * 70)
@@ -798,199 +785,81 @@ def recursive_forecast(
     logger.info("=" * 70)
 
     history = train_nf.copy()
-
     all_predictions = []
 
-    # -------------------------------------------------------------------------
-    # Semua equipment diproses bersamaan.
-    # -------------------------------------------------------------------------
-
-    equipment_ids = (
-        test_nf["unique_id"]
-        .unique()
-    )
-
-    test_dates = (
-        test_nf["ds"]
-        .sort_values()
-        .unique()
-    )
-
-    total_test_points = len(
-        test_dates
-    )
-
+    equipment_ids = test_nf["unique_id"].unique()
+    test_dates = test_nf["ds"].sort_values().unique()
+    total_test_points = len(test_dates)
     current_position = 0
 
     while current_position < total_test_points:
 
-        remaining = (
-            total_test_points
-            -
-            current_position
-        )
+        remaining = total_test_points - current_position
+        current_horizon = min(horizon, remaining)  # jumlah tanggal yang KITA BUTUHKAN dari step ini
 
-        current_horizon = min(
-            horizon,
-            remaining
-        )
-
-        # ---------------------------------------------------------------------
-        # Future dataframe HARUS lengkap untuk seluruh ID.
-        # ---------------------------------------------------------------------
-
+        # PENTING: future_df yang dikirim ke nf.predict() HARUS selalu berisi
+        # persis `horizon` (h) langkah ke depan, karena itu arsitektur tetap
+        # model NBEATSx -- BUKAN current_horizon, meskipun di window terakhir
+        # kita cuma butuh sebagian dari hasilnya.
         future_df = build_future_dataframe(
             history_nf=history,
-            steps=current_horizon,
+            steps=horizon,
             freq=freq
         )
 
-        # ---------------------------------------------------------------------
-        # Ambil hanya tanggal yang memang ingin diprediksi.
-        #
-        # Karena semua equipment diasumsikan punya timestamp yang sama,
-        # kita gunakan current test dates.
-        # ---------------------------------------------------------------------
-
+        # Tanggal yang benar-benar ingin kita ambil dari hasil prediksi kali ini
         expected_dates = pd.to_datetime(
-            test_dates[
-                current_position:
-                current_position
-                +
-                current_horizon
-            ]
+            test_dates[current_position: current_position + current_horizon]
         )
 
-        future_df = future_df[
-            future_df["ds"].isin(
-                expected_dates
-            )
-        ].copy()
-
-        # ---------------------------------------------------------------------
-        # Validasi kombinasi ID x timestamp.
-        # ---------------------------------------------------------------------
-
-        expected_count = (
-            len(equipment_ids)
-            *
-            current_horizon
-        )
-
-        if len(future_df) != expected_count:
-
-            raise ValueError(
-                "Future dataframe tidak lengkap.\n"
-                f"Expected combinations: "
-                f"{expected_count}\n"
-                f"Actual combinations: "
-                f"{len(future_df)}"
-            )
-
-        # ---------------------------------------------------------------------
         # Predict
-        # ---------------------------------------------------------------------
-
         forecast_df = nf.predict(
             df=history,
             futr_df=future_df
         )
 
-        # ---------------------------------------------------------------------
-        # Ambil hasil NBEATSx.
-        # ---------------------------------------------------------------------
-
         forecast_df = forecast_df[
-            [
-                "unique_id",
-                "ds",
-                "NBEATSx",
-            ]
+            ["unique_id", "ds", "NBEATSx"]
         ].copy()
 
         forecast_df = forecast_df.rename(
-            columns={
-                "NBEATSx": "prediction"
-            }
+            columns={"NBEATSx": "prediction"}
         )
 
-        all_predictions.append(
-            forecast_df
-        )
+        # Ambil HANYA tanggal yang memang kita butuhkan (di window terakhir,
+        # ini akan lebih sedikit dari horizon penuh -- sisanya dibuang karena
+        # melewati batas data test yang tersedia)
+        used_predictions = forecast_df[
+            forecast_df["ds"].isin(expected_dates)
+        ].copy()
 
-        # ---------------------------------------------------------------------
-        # IMPORTANT:
-        # Masukkan PREDICTION ke history.
-        #
-        # Jangan memasukkan actual test.
-        # ---------------------------------------------------------------------
+        all_predictions.append(used_predictions)
 
-        history_append = forecast_df.copy()
+        # Masukkan HANYA prediksi yang dipakai ke history (bukan seluruh
+        # horizon penuh), supaya posisi "last_date" di iterasi berikutnya
+        # tetap konsisten dengan tanggal test yang sesungguhnya.
+        history_append = used_predictions.rename(columns={"prediction": "y"})
 
-        history_append = (
-            history_append
-            .rename(
-                columns={
-                    "prediction": "y"
-                }
-            )
-        )
-
-        # Tambahkan calendar
-        history_append["hour"] = (
-            history_append["ds"]
-            .dt.hour
-            .astype(float)
-        )
-
-        history_append["dayofweek"] = (
-            history_append["ds"]
-            .dt.dayofweek
-            .astype(float)
-        )
-
-        history_append["day"] = (
-            history_append["ds"]
-            .dt.day
-            .astype(float)
-        )
-
-        history_append["month"] = (
-            history_append["ds"]
-            .dt.month
-            .astype(float)
-        )
-
-        history_append["is_weekend"] = (
-            history_append["ds"]
-            .dt.dayofweek >= 5
-        ).astype(float)
+        history_append["hour"] = history_append["ds"].dt.hour.astype(float)
+        history_append["dayofweek"] = history_append["ds"].dt.dayofweek.astype(float)
+        history_append["day"] = history_append["ds"].dt.day.astype(float)
+        history_append["month"] = history_append["ds"].dt.month.astype(float)
+        history_append["is_weekend"] = (history_append["ds"].dt.dayofweek >= 5).astype(float)
 
         history = pd.concat(
-            [
-                history,
-                history_append,
-            ],
+            [history, history_append],
             ignore_index=True
         )
 
-        history = (
-            history
-            .sort_values(
-                ["unique_id", "ds"]
-            )
-            .reset_index(drop=True)
-        )
+        history = history.sort_values(
+            ["unique_id", "ds"]
+        ).reset_index(drop=True)
 
         logger.info(
-            f"Forecasted "
-            f"{expected_dates.min()} -> "
-            f"{expected_dates.max()}"
+            f"Forecasted {expected_dates.min()} -> {expected_dates.max()}"
         )
 
-        current_position += (
-            current_horizon
-        )
+        current_position += current_horizon
 
     predictions = pd.concat(
         all_predictions,

@@ -1,741 +1,387 @@
+"""
+baseline.py
+===========
+Baseline sederhana (naive & moving-average) untuk pembanding NBEATSx, dengan
+metodologi split TANGGAL TETAP yang identik dengan train.py:
+    TRAIN : semua data <= train_end
+    TEST  : data dari test_start s/d test_end (dibatasi tanggal data terakhir
+            yang tersedia, sama seperti split_train_test() di train.py)
+
+Dua baseline yang dihitung:
+    - naive_last_value : nilai terakhir yang diketahui di akhir TRAIN,
+      diulang FLAT untuk seluruh periode TEST (tidak pakai info apapun
+      selain 1 titik data terakhir).
+    - moving_average    : rata-rata N hari terakhir di TRAIN (default 7),
+      diulang FLAT untuk seluruh periode TEST.
+
+Kedua baseline ini TIDAK memakai model apapun, TIDAK ada training, dan
+TIDAK ada recursive forecasting -- sengaja dibuat sesederhana mungkin
+supaya jadi tolok ukur minimum yang harus dilewati oleh NBEATSx.
+
+Output-nya (metrics.csv, predictions.csv, prediction_plot.png, run_info.json)
+sengaja dibuat dengan skema kolom yang SAMA seperti output train.py, supaya
+gampang dibandingkan langsung berdampingan.
+
+Cara pakai (CLI), dijalankan dari dalam folder N-BeatsX/:
+    python baseline.py --data-dir "../dataset/N-BeatsX processed" \
+        --output-dir artifacts_baseline --target pressure \
+        --train-end "2026-06-30 23:59:59" \
+        --test-start "2026-07-01 00:00:00" \
+        --test-end "2026-07-31 23:59:59" \
+        --ma-window 7
+
+Bisa juga dipakai sebagai module:
+    from baseline import Config, run_baseline
+    cfg = Config(data_dir="../dataset/N-BeatsX processed", output_dir="artifacts_baseline", target="pressure")
+    result = run_baseline(cfg)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
 )
+logger = logging.getLogger("baseline")
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# =============================================================================
+# KONFIGURASI
+# =============================================================================
+@dataclass
+class Config:
+    data_dir: str
+    output_dir: str
+    target: str
 
-# Folder tempat baseline.py berada
-# IMS-Model-Analytic/N-BeatsX/
-MODEL_DIR = Path(__file__).resolve().parent
+    # Fixed temporal split -- HARUS sama dengan yang dipakai train.py supaya
+    # perbandingan metrik-nya adil (apple-to-apple)
+    train_end: str = "2026-06-30 23:59:59"
+    test_start: str = "2026-07-01 00:00:00"
+    test_end: str = "2026-07-31 23:59:59"
 
-# Root project
-# IMS-Model-Analytic/
-PROJECT_ROOT = MODEL_DIR.parent
-
-# Dataset
-DATASET_DIR = PROJECT_ROOT / "dataset" / "N-BeatsX processed"
-
-# Gunakan FULL DATA, bukan reference_train/reference_test
-DATA_FILE = DATASET_DIR / "full_clean.parquet"
-
-# Output baseline
-OUTPUT_DIR = MODEL_DIR / "artifacts" / "baseline"
-
-# Target
-TARGET_COL = "pressure"
-
-# Datetime
-DATETIME_COL = "DateTime"
-
-# ============================================================
-# TIME-BASED HOLD-OUT
-# ============================================================
-
-# Training hanya sampai 30 Juni 2026
-TRAIN_END = pd.Timestamp("2026-06-30 23:59:59")
-
-# Testing mulai 1 Juli 2026
-TEST_START = pd.Timestamp("2026-07-01 00:00:00")
-
-EPSILON = 1e-8
+    # jumlah hari/titik terakhir di TRAIN yang dipakai untuk moving average
+    ma_window: int = 7
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+# =============================================================================
+# LOAD DATA (identik dengan train.py, supaya konsisten)
+# =============================================================================
+def load_data(cfg: Config):
+    logger.info("=" * 70)
+    logger.info("LOADING DATA")
+    logger.info("=" * 70)
 
-def find_column(df, target_name):
-    """
-    Mencari nama kolom secara case-insensitive.
-    """
+    data_dir = Path(cfg.data_dir)
+    parquet_file = data_dir / "full_clean.parquet"
+    metadata_file = data_dir / "metadata.json"
 
-    target_lower = target_name.lower()
+    if not parquet_file.exists():
+        raise FileNotFoundError(f"Dataset tidak ditemukan:\n{parquet_file}")
+    if not metadata_file.exists():
+        raise FileNotFoundError(f"metadata.json tidak ditemukan:\n{metadata_file}")
 
-    for col in df.columns:
-        if str(col).lower() == target_lower:
-            return col
+    df = pd.read_parquet(parquet_file)
+    with open(metadata_file, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
 
-    return None
+    datetime_col = metadata.get("datetime_col", "DateTime")
+    if datetime_col not in df.columns:
+        raise ValueError(f"Kolom datetime '{datetime_col}' tidak ditemukan.")
 
+    df[datetime_col] = pd.to_datetime(df[datetime_col], errors="coerce")
+    df = df.dropna(subset=[datetime_col])
 
-def find_datetime_column(df):
-    """
-    Mencari kolom datetime secara fleksibel.
-    """
-
-    possible_names = [
-        "datetime",
-        "date_time",
-        "timestamp",
-        "time",
-    ]
-
-    for col in df.columns:
-        if str(col).lower() in possible_names:
-            return col
-
-    return None
-
-
-def calculate_mape(y_true, y_pred):
-    """
-    Menghitung MAPE dalam persen.
-
-    Nilai aktual yang sangat dekat dengan 0
-    dikeluarkan dari perhitungan agar MAPE stabil.
-    """
-
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-
-    mask = np.abs(y_true) > EPSILON
-
-    if not np.any(mask):
-        return np.nan
-
-    return (
-        np.mean(
-            np.abs(
-                (y_true[mask] - y_pred[mask])
-                / y_true[mask]
-            )
-        )
-        * 100
-    )
-
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-
-def load_data():
-
-    print("=" * 70)
-    print("LOADING FULL DATASET")
-    print("=" * 70)
-
-    print(f"Dataset : {DATA_FILE}")
-
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(
-            f"Dataset tidak ditemukan:\n{DATA_FILE}"
-        )
-
-    df = pd.read_parquet(DATA_FILE)
-
-    print(f"\nDataset shape: {df.shape}")
-
-    print("\nColumns:")
-    print(df.columns.tolist())
-
-    # --------------------------------------------------------
-    # Cari datetime column
-    # --------------------------------------------------------
-
-    datetime_col = find_column(
-        df,
-        DATETIME_COL
-    )
-
-    if datetime_col is None:
-        datetime_col = find_datetime_column(df)
-
-    if datetime_col is None:
+    if cfg.target not in metadata["target_cols"]:
         raise ValueError(
-            "Kolom DateTime tidak ditemukan di dataset."
+            f"Target '{cfg.target}' tidak tersedia.\nTarget tersedia: {metadata['target_cols']}"
         )
+    if cfg.target not in df.columns:
+        raise ValueError(f"Kolom target '{cfg.target}' tidak ditemukan di dataset.")
 
-    # --------------------------------------------------------
-    # Convert datetime
-    # --------------------------------------------------------
+    group_col = metadata.get("group_col", "equipment_id")
+    df = df.sort_values([group_col, datetime_col]).reset_index(drop=True)
 
-    df[datetime_col] = pd.to_datetime(
-        df[datetime_col],
-        errors="coerce"
-    )
+    df[cfg.target] = pd.to_numeric(df[cfg.target], errors="coerce")
+    df = df.dropna(subset=[cfg.target]).reset_index(drop=True)
 
-    # Hapus datetime invalid
-    df = df.dropna(
-        subset=[datetime_col]
-    ).copy()
+    logger.info(f"Rows       : {len(df):,}")
+    logger.info(f"Equipment  : {df[group_col].nunique()}")
+    logger.info(f"Date range : {df[datetime_col].min()} -> {df[datetime_col].max()}")
 
-    # Sort berdasarkan waktu
-    df = df.sort_values(
-        datetime_col
-    ).reset_index(drop=True)
-
-    print(f"\nDatetime column : {datetime_col}")
-    print(f"Dataset start   : {df[datetime_col].min()}")
-    print(f"Dataset end     : {df[datetime_col].max()}")
-
-    return df, datetime_col
+    return df, metadata
 
 
-# ============================================================
-# CREATE TIME-BASED SPLIT
-# ============================================================
+# =============================================================================
+# SPLIT (identik dengan split_train_test() di train.py)
+# =============================================================================
+def split_train_test(df: pd.DataFrame, cfg: Config, metadata: dict):
+    logger.info("=" * 70)
+    logger.info("FIXED TRAIN / TEST SPLIT")
+    logger.info("=" * 70)
 
-def create_time_split(df, datetime_col):
+    datetime_col = metadata["datetime_col"]
+    group_col = metadata["group_col"]
 
-    print("\n" + "=" * 70)
-    print("CREATING TIME-BASED TRAIN / TEST SPLIT")
-    print("=" * 70)
+    train_end = pd.Timestamp(cfg.train_end)
+    test_start = pd.Timestamp(cfg.test_start)
+    test_end_requested = pd.Timestamp(cfg.test_end)
 
-    # --------------------------------------------------------
-    # Training
-    # --------------------------------------------------------
+    actual_data_end = df[datetime_col].max()
+    test_end = min(test_end_requested, actual_data_end)
 
-    train_df = df[
-        df[datetime_col] <= TRAIN_END
-    ].copy()
+    train_df = df[df[datetime_col] <= train_end].copy()
+    test_df = df[(df[datetime_col] >= test_start) & (df[datetime_col] <= test_end)].copy()
 
-    # --------------------------------------------------------
-    # Testing
-    # --------------------------------------------------------
+    if len(train_df) == 0:
+        raise ValueError("TRAIN kosong. Periksa train_end.")
+    if len(test_df) == 0:
+        raise ValueError("TEST kosong. Periksa test_start/test_end.")
 
-    test_df = df[
-        df[datetime_col] >= TEST_START
-    ].copy()
+    logger.info(f"TRAIN : {train_df[datetime_col].min()} -> {train_df[datetime_col].max()}")
+    logger.info(f"TEST  : {test_df[datetime_col].min()} -> {test_df[datetime_col].max()}")
+    logger.info(f"Train rows : {len(train_df):,}")
+    logger.info(f"Test rows  : {len(test_df):,}")
 
-    # --------------------------------------------------------
-    # Remove rows with missing target
-    # --------------------------------------------------------
-
-    train_target_col = find_column(
-        train_df,
-        TARGET_COL
-    )
-
-    test_target_col = find_column(
-        test_df,
-        TARGET_COL
-    )
-
-    if train_target_col is None:
-        raise ValueError(
-            f"Kolom target '{TARGET_COL}' "
-            "tidak ditemukan pada training data."
-        )
-
-    if test_target_col is None:
-        raise ValueError(
-            f"Kolom target '{TARGET_COL}' "
-            "tidak ditemukan pada testing data."
-        )
-
-    train_df = train_df.dropna(
-        subset=[train_target_col]
-    ).copy()
-
-    test_df = test_df.dropna(
-        subset=[test_target_col]
-    ).copy()
-
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
-    if train_df.empty:
-        raise ValueError(
-            "Training data kosong."
-        )
-
-    if test_df.empty:
-        raise ValueError(
-            "Testing data kosong."
-        )
-
-    # Pastikan tidak ada overlap
-    latest_train = train_df[datetime_col].max()
-    earliest_test = test_df[datetime_col].min()
-
-    if latest_train >= earliest_test:
-        raise ValueError(
-            "TRAIN dan TEST overlap."
-        )
-
-    # --------------------------------------------------------
-    # Print split information
-    # --------------------------------------------------------
-
-    print("\nTRAIN")
-    print("-" * 70)
-    print(f"Start : {train_df[datetime_col].min()}")
-    print(f"End   : {train_df[datetime_col].max()}")
-    print(f"Rows  : {len(train_df)}")
-
-    print("\nTEST")
-    print("-" * 70)
-    print(f"Start : {test_df[datetime_col].min()}")
-    print(f"End   : {test_df[datetime_col].max()}")
-    print(f"Rows  : {len(test_df)}")
-
-    print("\nExpected cutoff:")
-    print(f"Train <= {TRAIN_END}")
-    print(f"Test  >= {TEST_START}")
+    for uid, g in test_df.groupby(group_col):
+        logger.info(f"  {uid}: {len(g)} points")
 
     return train_df, test_df
 
 
-# ============================================================
-# NAIVE BASELINE
-# ============================================================
+# =============================================================================
+# HITUNG BASELINE (naive last-value & moving average)
+# =============================================================================
+def compute_baselines(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    metadata: dict,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Untuk tiap equipment: ambil nilai terakhir (dan rata-rata N hari terakhir)
+    dari TRAIN, lalu diulang FLAT untuk semua timestamp di TEST equipment itu.
+    """
+    datetime_col = metadata["datetime_col"]
+    group_col = metadata["group_col"]
 
-def create_naive_forecast(
-    train_df,
-    test_df,
-):
+    rows = []
+    for uid, g_test in test_df.groupby(group_col):
+        g_train = train_df[train_df[group_col] == uid].sort_values(datetime_col)
+        if g_train.empty:
+            logger.warning(f"  -> equipment '{uid}' tidak punya data TRAIN, dilewati")
+            continue
 
-    print("\n" + "=" * 70)
-    print("CREATING NAIVE / PERSISTENCE BASELINE")
-    print("=" * 70)
+        last_value = float(g_train[cfg.target].iloc[-1])
+        ma_value = float(g_train[cfg.target].tail(cfg.ma_window).mean())
 
-    train_target_col = find_column(
-        train_df,
-        TARGET_COL
-    )
+        for _, row in g_test.sort_values(datetime_col).iterrows():
+            rows.append({
+                "unique_id": str(uid),
+                "ds": row[datetime_col],
+                "y": float(row[cfg.target]),
+                "naive_last_value": last_value,
+                "moving_average": ma_value,
+            })
 
-    test_target_col = find_column(
-        test_df,
-        TARGET_COL
-    )
-
-    if train_target_col is None:
-        raise ValueError(
-            f"Kolom target '{TARGET_COL}' "
-            "tidak ditemukan di training data."
-        )
-
-    if test_target_col is None:
-        raise ValueError(
-            f"Kolom target '{TARGET_COL}' "
-            "tidak ditemukan di testing data."
-        )
-
-    # --------------------------------------------------------
-    # Ambil nilai terakhir dari TRAIN
-    # --------------------------------------------------------
-
-    train_target = (
-        train_df[train_target_col]
-        .astype(float)
-        .dropna()
-    )
-
-    if train_target.empty:
-        raise ValueError(
-            "Tidak ada nilai target valid di training data."
-        )
-
-    last_train_value = float(
-        train_target.iloc[-1]
-    )
-
-    print(f"\nTarget column     : {train_target_col}")
-    print(f"Last train value : {last_train_value}")
-
-    # --------------------------------------------------------
-    # Naive / Persistence forecast
-    # --------------------------------------------------------
-
-    # Semua nilai TEST diprediksi menggunakan
-    # nilai terakhir TRAIN.
-    predictions = np.full(
-        len(test_df),
-        last_train_value,
-        dtype=float,
-    )
-
-    actual = (
-        test_df[test_target_col]
-        .astype(float)
-        .to_numpy()
-    )
-
-    return (
-        actual,
-        predictions,
-        last_train_value,
-    )
+    result = pd.DataFrame(rows)
+    logger.info(f"  -> {len(result):,} titik baseline dihitung untuk {result['unique_id'].nunique()} equipment")
+    return result
 
 
-# ============================================================
-# EVALUATION
-# ============================================================
+# =============================================================================
+# METRIK (identik dengan calculate_metrics() di train.py)
+# =============================================================================
+def calculate_metrics(y_true, y_pred) -> dict:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
 
-def evaluate_model(
-    y_true,
-    y_pred,
-):
-
-    mae = mean_absolute_error(
-        y_true,
-        y_pred,
-    )
-
-    mse = mean_squared_error(
-        y_true,
-        y_pred,
-    )
-
+    error = y_true - y_pred
+    mae = np.mean(np.abs(error))
+    mse = np.mean(error ** 2)
     rmse = np.sqrt(mse)
 
-    mape = calculate_mape(
-        y_true,
-        y_pred,
-    )
+    mask = np.abs(y_true) > 1e-6
+    if mask.sum() > 0:
+        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+    else:
+        mape = np.nan
 
-    r2 = r2_score(
-        y_true,
-        y_pred,
-    )
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
 
-    metrics = {
-        "mae": mae,
-        "mse": mse,
-        "rmse": rmse,
-        "mape_pct": mape,
-        "r2": r2,
+    return {
+        "mae": float(mae),
+        "mse": float(mse),
+        "rmse": float(rmse),
+        "mape_pct": float(mape),
+        "r2": float(r2),
         "n_points": len(y_true),
     }
 
-    return metrics
 
-
-# ============================================================
-# SAVE RESULTS
-# ============================================================
-
-def save_results(
-    test_df,
-    datetime_col,
-    y_true,
-    y_pred,
-    metrics,
-    last_train_value,
-):
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # --------------------------------------------------------
-    # Predictions
-    # --------------------------------------------------------
-
-    predictions_df = pd.DataFrame({
-        datetime_col: test_df[
-            datetime_col
-        ].values,
-
-        "actual": y_true,
-
-        "prediction": y_pred,
-
-        "error": y_true - y_pred,
-
-        "absolute_error": np.abs(
-            y_true - y_pred
-        ),
-    })
-
-    predictions_file = (
-        OUTPUT_DIR
-        / "baseline_predictions.csv"
-    )
-
-    predictions_df.to_csv(
-        predictions_file,
-        index=False,
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    metrics_df = pd.DataFrame([
-        metrics
-    ])
-
-    metrics_file = (
-        OUTPUT_DIR
-        / "baseline_metrics.csv"
-    )
-
-    metrics_df.to_csv(
-        metrics_file,
-        index=False,
-    )
-
-    # --------------------------------------------------------
-    # Configuration
-    # --------------------------------------------------------
-
-    config_df = pd.DataFrame({
-        "parameter": [
-            "baseline",
-            "target",
-            "train_end",
-            "test_start",
-            "last_train_value",
-            "test_points",
-        ],
-
-        "value": [
-            "Naive / Persistence",
-            TARGET_COL,
-            TRAIN_END,
-            TEST_START,
-            last_train_value,
-            len(test_df),
-        ],
-    })
-
-    config_file = (
-        OUTPUT_DIR
-        / "baseline_config.csv"
-    )
-
-    config_df.to_csv(
-        config_file,
-        index=False,
-    )
-
-    print("\nResults saved:")
-    print(f"- {predictions_file}")
-    print(f"- {metrics_file}")
-    print(f"- {config_file}")
-
-    return predictions_df
-
-
-# ============================================================
+# =============================================================================
 # PLOT
-# ============================================================
+# =============================================================================
+def save_plot(predictions_df: pd.DataFrame, output_dir: Path, target: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-def plot_results(
-    test_df,
-    datetime_col,
-    y_true,
-    y_pred,
-):
+    plot_file = output_dir / "prediction_plot.png"
+    plt.figure(figsize=(14, 6))
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    for uid, g in predictions_df.groupby("unique_id"):
+        g = g.sort_values("ds")
+        plt.plot(g["ds"], g["y"], marker="o", label=f"{uid} - Actual", color="black")
+        plt.plot(g["ds"], g["naive_last_value"], marker="x", linestyle="--",
+                  label=f"{uid} - Naive (last value)", color="tab:blue")
+        plt.plot(g["ds"], g["moving_average"], marker="s", linestyle=":",
+                  label=f"{uid} - Moving average", color="tab:green")
 
-    x = pd.to_datetime(
-        test_df[datetime_col]
-    )
-
-    plt.figure(
-        figsize=(14, 6)
-    )
-
-    plt.plot(
-        x,
-        y_true,
-        marker="o",
-        label="Actual Pressure",
-    )
-
-    plt.plot(
-        x,
-        y_pred,
-        marker="x",
-        linestyle="--",
-        label="Naive Baseline",
-    )
-
-    plt.title(
-        "Naive Baseline vs Actual Pressure\n"
-        "Hold-out Test: July 2026"
-    )
-
-    plt.xlabel(
-        "Date"
-    )
-
-    plt.ylabel(
-        "Pressure"
-    )
-
+    plt.title(f"Baseline vs Actual - {target}")
+    plt.xlabel("Date")
+    plt.ylabel(target)
     plt.legend()
-
-    plt.grid(
-        True,
-        alpha=0.3,
-    )
-
-    plt.xticks(
-        rotation=45
-    )
-
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-
-    plot_file = (
-        OUTPUT_DIR
-        / "baseline_vs_actual.png"
-    )
-
-    plt.savefig(
-        plot_file,
-        dpi=300,
-        bbox_inches="tight",
-    )
-
+    plt.savefig(plot_file, dpi=300, bbox_inches="tight")
     plt.close()
 
-    print(f"- {plot_file}")
+    logger.info(f"Saved plot        : {plot_file}")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# =============================================================================
+# SIMPAN OUTPUT (skema kolom SAMA seperti train.py, biar mudah dibandingkan)
+# =============================================================================
+def save_results(
+    output_dir: Path,
+    predictions_df: pd.DataFrame,
+    metrics_naive: dict,
+    metrics_ma: dict,
+    cfg: Config,
+    metadata: dict,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-def main():
+    predictions_df.to_csv(output_dir / "predictions.csv", index=False)
 
-    print("\n")
+    metrics_combined = pd.DataFrame([
+        {"method": "naive_last_value", **metrics_naive},
+        {"method": "moving_average", **metrics_ma},
+    ])
+    metrics_combined.to_csv(output_dir / "metrics.csv", index=False)
 
-    print("=" * 70)
-    print("NAIVE BASELINE - N-BEATSX DATASET")
-    print("=" * 70)
+    run_info = {
+        "target": cfg.target,
+        "train_end": cfg.train_end,
+        "test_start": cfg.test_start,
+        "test_end": cfg.test_end,
+        "actual_test_end": str(predictions_df["ds"].max()) if len(predictions_df) else None,
+        "ma_window": cfg.ma_window,
+        "freq": metadata["freq"],
+        "methods": ["naive_last_value", "moving_average"],
+        "metrics": {"naive_last_value": metrics_naive, "moving_average": metrics_ma},
+    }
+    with open(output_dir / "run_info.json", "w", encoding="utf-8") as f:
+        json.dump(run_info, f, indent=2)
 
-    print("\nEvaluation strategy:")
-    print(
-        "TRAIN : <= 2026-06-30"
+    logger.info(f"Saved predictions : {output_dir / 'predictions.csv'}")
+    logger.info(f"Saved metrics     : {output_dir / 'metrics.csv'}")
+    logger.info(f"Saved run info    : {output_dir / 'run_info.json'}")
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+def run_baseline(cfg: Config) -> dict:
+    logger.info("=" * 70)
+    logger.info(f"BASELINE FORECASTING - {cfg.target}")
+    logger.info("=" * 70)
+
+    df, metadata = load_data(cfg)
+    train_df, test_df = split_train_test(df, cfg, metadata)
+
+    logger.info("=" * 70)
+    logger.info("MENGHITUNG BASELINE (naive last-value & moving average)")
+    logger.info("=" * 70)
+    predictions_df = compute_baselines(train_df, test_df, metadata, cfg)
+
+    metrics_naive = calculate_metrics(predictions_df["y"], predictions_df["naive_last_value"])
+    metrics_ma = calculate_metrics(predictions_df["y"], predictions_df["moving_average"])
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("HASIL BASELINE")
+    logger.info("=" * 70)
+    logger.info(
+        f"[naive_last_value] MAE={metrics_naive['mae']:.4f}  RMSE={metrics_naive['rmse']:.4f}  "
+        f"MAPE={metrics_naive['mape_pct']:.2f}%  R2={metrics_naive['r2']:.4f}  n={metrics_naive['n_points']}"
+    )
+    logger.info(
+        f"[moving_average]   MAE={metrics_ma['mae']:.4f}  RMSE={metrics_ma['rmse']:.4f}  "
+        f"MAPE={metrics_ma['mape_pct']:.2f}%  R2={metrics_ma['r2']:.4f}  n={metrics_ma['n_points']}"
     )
 
-    print(
-        "TEST  : >= 2026-07-01"
+    output_dir = Path(cfg.output_dir)
+    save_results(output_dir, predictions_df, metrics_naive, metrics_ma, cfg, metadata)
+    save_plot(predictions_df, output_dir, cfg.target)
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("BASELINE SELESAI")
+    logger.info("=" * 70)
+
+    return {
+        "predictions": predictions_df,
+        "metrics_naive": metrics_naive,
+        "metrics_moving_average": metrics_ma,
+    }
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Baseline naive/moving-average untuk pembanding NBEATSx (fixed date split)"
     )
 
-    # --------------------------------------------------------
-    # 1. Load full dataset
-    # --------------------------------------------------------
+    p.add_argument("--data-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--target", required=True, choices=["pressure", "flowrate", "temperature"])
 
-    df, datetime_col = load_data()
+    p.add_argument("--train-end", default="2026-06-30 23:59:59")
+    p.add_argument("--test-start", default="2026-07-01 00:00:00")
+    p.add_argument("--test-end", default="2026-07-31 23:59:59")
 
-    # --------------------------------------------------------
-    # 2. Time-based split
-    # --------------------------------------------------------
+    p.add_argument("--ma-window", type=int, default=7)
 
-    train_df, test_df = create_time_split(
-        df,
-        datetime_col,
+    args = p.parse_args()
+
+    return Config(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        target=args.target,
+        train_end=args.train_end,
+        test_start=args.test_start,
+        test_end=args.test_end,
+        ma_window=args.ma_window,
     )
 
-    # --------------------------------------------------------
-    # 3. Create baseline
-    # --------------------------------------------------------
-
-    (
-        y_true,
-        y_pred,
-        last_train_value,
-    ) = create_naive_forecast(
-        train_df,
-        test_df,
-    )
-
-    # --------------------------------------------------------
-    # 4. Evaluation
-    # --------------------------------------------------------
-
-    metrics = evaluate_model(
-        y_true,
-        y_pred,
-    )
-
-    # --------------------------------------------------------
-    # 5. Print metrics
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("BASELINE RESULTS")
-    print("=" * 70)
-
-    print(
-        f"MAE      : {metrics['mae']:.6f}"
-    )
-
-    print(
-        f"MSE      : {metrics['mse']:.6f}"
-    )
-
-    print(
-        f"RMSE     : {metrics['rmse']:.6f}"
-    )
-
-    print(
-        f"MAPE (%) : {metrics['mape_pct']:.6f}"
-    )
-
-    print(
-        f"R²       : {metrics['r2']:.6f}"
-    )
-
-    print(
-        f"N Points : {metrics['n_points']}"
-    )
-
-    # --------------------------------------------------------
-    # 6. Save
-    # --------------------------------------------------------
-
-    predictions_df = save_results(
-        test_df,
-        datetime_col,
-        y_true,
-        y_pred,
-        metrics,
-        last_train_value,
-    )
-
-    # --------------------------------------------------------
-    # 7. Plot
-    # --------------------------------------------------------
-
-    plot_results(
-        test_df,
-        datetime_col,
-        y_true,
-        y_pred,
-    )
-
-    # --------------------------------------------------------
-    # 8. Print predictions
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("PREDICTIONS")
-    print("=" * 70)
-
-    print(
-        predictions_df.to_string(
-            index=False
-        )
-    )
-
-    print("\nDone.")
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-    main()
+    config = parse_args()
+    logger.info(f"Konfigurasi:\n{json.dumps(asdict(config), indent=2)}")
+    run_baseline(config)
