@@ -6,6 +6,9 @@ DeepAR/artifacts
 N-BeatsX/artifacts
 N-BeatsX/artifacts_baseline
 N-BeatsX/artifacts_direct
+N-BeatsX/artifacts_trend_check
+N-BeatsX/artifacts_trend_check_flowrate
+N-BeatsX/artifacts_trend_check_temperature
 N-BeatsX/data
 N-BeatsX/__pycache__
 lightning_logs
